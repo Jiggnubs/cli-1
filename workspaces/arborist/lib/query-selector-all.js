@@ -291,11 +291,96 @@ class Results {
   }
 
   semverPseudo () {
-    if (!this.currentAstNode.semverValue) {
+    const { lookupProperties, attributeMatcher, semverFunc, semverValue } = this.currentAstNode
+    if (!semverValue) {
       return this.initialItems
     }
-    return this.initialItems.filter(node =>
-      semver.satisfies(node.version, this.currentAstNode.semverValue))
+
+    if (!semver.valid(semverValue) && !semver.validRange(semverValue)) {
+      throw Object.assign(
+        new Error(`\`${semverValue}\` is not a valid semver version or range`),
+        { code: 'EQUERYINVALIDSEMVER' })
+    }
+
+    const valueIsVersion = !!semver.valid(semverValue)
+
+    const nodeMatches = (node, obj) => {
+      // if we already have an operator, the user provided some test as part of the selector
+      // we evaluate that first because if it fails we don't want this node anyway
+      if (attributeMatcher.operator) {
+        if (!attributeMatch(attributeMatcher, obj)) {
+          // if the initial operator doesn't match, we're done
+          return false
+        }
+      }
+
+      // read the value from the provided object
+      const foundValue = obj[attributeMatcher.qualifiedAttribute]
+      // if the value is not a valid semver version or range, we can't match so we're done
+      if (!foundValue || (!semver.valid(foundValue) && !semver.validRange(foundValue))) {
+        return false
+      }
+      const foundIsVersion = !!semver.valid(foundValue)
+
+      // make a new matcher inline to do the semver checks
+      const semverMatcher = {
+        qualifiedAttribute: attributeMatcher.qualifiedAttribute,
+        value: semverValue,
+      }
+
+      // if we were provided an operator function, see if we can use that
+      if (semverFunc) {
+        // these functions each need 2 versions _not_ ranges or they'll throw, so we skip any nodes
+        // that would cause an error to be thrown
+        if (['eq', 'neq', 'gt', 'gte', 'lt', 'lte'].includes(semverFunc)) {
+          if (!valueIsVersion || !foundIsVersion) {
+            return false
+          }
+        }
+
+        // since versions are valid ranges, any other supported function is fine
+        semverMatcher.operator = `semver.${semverFunc}`
+      } else {
+        // otherwise infer what type of operator we need based on the types of the two values
+        if (foundIsVersion && valueIsVersion) {
+          // 2 versions
+          semverMatcher.operator = 'semver.eq'
+        } else if (!foundIsVersion && !valueIsVersion) {
+          // 2 ranges
+          semverMatcher.operator = 'semver.intersects'
+        } else {
+          // 1 version, 1 range
+          semverMatcher.operator = 'semver.satisfies'
+        }
+      }
+
+      return attributeMatch(semverMatcher, obj)
+    }
+
+    return this.initialItems.filter((node) => {
+      // no lookupProperties just means its a top level property, see if it matches
+      if (!lookupProperties.length) {
+        return nodeMatches(node, node.package)
+      }
+
+      // this code is mostly duplicated from attrPseudo to traverse into the package until we get
+      // to our deepest requested object
+      let objs = [node.package]
+      for (const prop of lookupProperties) {
+        if (prop === arrayDelimiter) {
+          objs = objs.flat()
+          continue
+        }
+
+        objs = objs.flatMap(obj => obj[prop] || [])
+        const noAttr = objs.every(obj => !obj)
+        if (noAttr) {
+          return false
+        }
+
+        return objs.some(obj => nodeMatches(node, obj))
+      }
+    })
   }
 
   typePseudo () {
@@ -345,6 +430,50 @@ const attributeOperators = {
   '$=' ({ attr, value, insensitive }) {
     return attr.endsWith(value)
   },
+  // semver comparisons, these are internal operators used by semverPseudo
+  // functions that take 2 versions
+  'semver.eq' ({ attr, value }) {
+    return semver.eq(attr, value)
+  },
+  'semver.neq' ({ attr, value }) {
+    return semver.neq(attr, value)
+  },
+  'semver.gt' ({ attr, value }) {
+    return semver.gt(attr, value)
+  },
+  'semver.gte' ({ attr, value }) {
+    return semver.gte(attr, value)
+  },
+  'semver.lt' ({ attr, value }) {
+    return semver.lt(attr, value)
+  },
+  'semver.lte' ({ attr, value }) {
+    return semver.lte(attr, value)
+  },
+  // functions that take 2 ranges
+  'semver.intersects' ({ attr, value }) {
+    return semver.intersects(attr, value)
+  },
+  'semver.subset' ({ attr, value }) {
+    return semver.subset(attr, value)
+  },
+  // functions that take 1 version and 1 range, for these we infer the order to pass
+  // parameters on the user's behalf
+  'semver.gtr' ({ attr, value }) {
+    return semver.valid(attr)
+      ? semver.gtr(attr, value)
+      : semver.gtr(value, attr)
+  },
+  'semver.ltr' ({ attr, value }) {
+    return semver.valid(attr)
+      ? semver.ltr(attr, value)
+      : semver.ltr(value, attr)
+  },
+  'semver.satisfies' ({ attr, value }) {
+    return semver.valid(attr)
+      ? semver.satisfies(attr, value)
+      : semver.satisfies(value, attr)
+  },
 }
 
 const attributeOperator = ({ attr, value, insensitive, operator }) => {
@@ -358,6 +487,13 @@ const attributeOperator = ({ attr, value, insensitive, operator }) => {
   if (insensitive) {
     attr = attr.toLowerCase()
   }
+
+  if (!attributeOperators[operator]) {
+    throw Object.assign(
+      new Error(`\`${operator}\` is not a supported operator.`),
+      { code: 'EQUERYINVALIDOPERATOR' })
+  }
+
   return attributeOperators[operator]({
     attr,
     insensitive,
